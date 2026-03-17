@@ -1,78 +1,82 @@
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+import requests
+import json
 import os
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
 
-app = FastAPI()
+app = Flask(__name__)
+# CORS enabled for all origins
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Allow your frontend to talk to this backend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ORBIT_BASE_URL = "https://api.orbit-provider.com/api/provider/agy/v1/messages"
 
-# The Disguise Headers to bypass blocks
-DISGUISE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "cross-site"
-}
+@app.route('/api/proxy', methods=['POST', 'OPTIONS'])
+@app.route('/api/proxy/<path:path>', methods=['POST', 'OPTIONS'])
+def proxy_request(path=None):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
 
-@app.post("/proxy")
-async def proxy_request(request: Request):
-    """
-    Receives { target_url, method, headers, payload } from the frontend,
-    adds the disguise, and forwards the stream back.
-    """
-    data = await request.json()
-    target_url = data.get("target_url")
-    method = data.get("method", "POST").upper()
-    headers = data.get("headers", {})
-    payload = data.get("payload", None)
-
-    # Merge your custom headers with the disguise headers
-    final_headers = {**headers, **DISGUISE_HEADERS}
-    
-    # Remove 'host' so HTTPX automatically calculates it for OpenAI/Gemini
-    final_headers.pop("host", None)
-    final_headers.pop("Host", None)
-
-    # Handle Standard GET Requests (e.g., checking API Key status & fetching models)
-    if method == "GET":
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.get(target_url, headers=final_headers)
+    try:
+        incoming_data = request.json
+        
+        # API Key handle karna (Bearer Auth aur x-api-key dono ko support karega)
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            api_key = auth_header.split(" ")[1]
+        else:
+            api_key = request.headers.get("x-api-key", "")
             
-            # Remove proxy-breaking headers
-            resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in ["content-encoding", "content-length", "transfer-encoding", "connection"]}
-            return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
+        # --- OPENAI SE ANTHROPIC FORMAT CONVERTER ---
+        messages = incoming_data.get("messages", [])
+        system_prompt = ""
+        anthropic_messages = []
+        
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt += msg.get("content", "") + "\n"
+            else:
+                anthropic_messages.append(msg)
+        
+        payload = {
+            "model": incoming_data.get("model", ""),
+            "max_tokens": incoming_data.get("max_tokens", 8192),
+            "messages": anthropic_messages,
+            "stream": True, # STREAMING ON
+            "temperature": incoming_data.get("temperature", 0.3)
+        }
+        
+        if system_prompt.strip():
+            payload["system"] = system_prompt.strip()
 
-    # Handle Streaming POST Requests (e.g., AI Translation/Analysis generation)
-    if method == "POST":
-        client = httpx.AsyncClient(timeout=120.0)
-        req = client.build_request("POST", target_url, headers=final_headers, json=payload)
-        response = await client.send(req, stream=True)
+        # Strict Disguise Headers
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/event-stream, */*",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site"
+        }
 
-        async def stream_generator():
-            async for chunk in response.aiter_bytes():
-                yield chunk
-            await response.aclose()
-            await client.aclose()
+        # Orbit ko Streaming Request bhejna
+        req = requests.post(ORBIT_BASE_URL, headers=headers, json=payload, stream=True)
 
-        resp_headers = {k: v for k, v in response.headers.items() if k.lower() not in ["content-encoding", "content-length", "transfer-encoding", "connection"]}
-        return StreamingResponse(stream_generator(), status_code=response.status_code, headers=resp_headers)
+        if req.status_code != 200:
+            return jsonify({"error": "Provider Error", "status": req.status_code, "details": req.text}), req.status_code
 
-# Railway automatically passes the PORT environment variable
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        # Generator function jo SSE chunks wapis bhejega
+        def generate():
+            for line in req.iter_lines():
+                if line:
+                    yield line.decode('utf-8') + '\n\n'
+
+        return Response(generate(), mimetype='text/event-stream')
+
+    except Exception as e:
+        return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
+
+if __name__ == '__main__':
+    # Railway environment variable se PORT khud uthayega, warna local par 5000 use karega
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
